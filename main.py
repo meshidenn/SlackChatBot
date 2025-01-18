@@ -50,33 +50,148 @@ def process_message(event, say, is_mention=False):
     # Get conversation history
     history = get_conversation_history(channel_id, thread_ts)
     
-    # Determine which AI to use based on text
+    # Send initial message
+    initial_response = say(text="思考中...", thread_ts=thread_ts)
+    message_ts = initial_response['ts']
+    
+    # Determine which AI to use based on text and get streaming response
     if "openai" in text.lower():
-        response = handle_openai(text, history)
+        final_response = handle_openai(text, history, channel_id, thread_ts, message_ts, app.client)
     elif "claude" in text.lower():
-        response = handle_claude(text, history)
+        final_response = handle_claude(text, history, channel_id, thread_ts, message_ts, app.client)
     elif "gemini" in text.lower():
-        response = handle_gemini(text, history)
+        final_response = handle_gemini(text, history, channel_id, thread_ts, message_ts, app.client)
     else:
         # Default to OpenAI
-        response = handle_openai(text, history)
+        final_response = handle_openai(text, history, channel_id, thread_ts, message_ts, app.client)
     
     # Save the updated conversation
     history.extend([
         {"role": "user", "content": text},
-        {"role": "assistant", "content": response}
+        {"role": "assistant", "content": final_response}
     ])
     save_conversation(channel_id, thread_ts, history)
-    
-    # Send response in thread
-    say(text=response, thread_ts=thread_ts)
 
-# @app.event("app_mention")
+def handle_openai(text, history, channel_id, thread_ts, message_ts, client):
+    """Handle OpenAI chat completion with streaming"""
+    messages = [{"role": "system", "content": "You are a helpful assistant."}]
+    for msg in history:
+        messages.append({"role": msg["role"], "content": msg["content"]})
+    messages.append({"role": "user", "content": text})
+    
+    accumulated_response = ""
+    buffer = ""
+    
+    stream = openai.chat.completions.create(
+        model="gpt-4-turbo-preview",
+        messages=messages,
+        stream=True
+    )
+    
+    for chunk in stream:
+        if chunk.choices[0].delta.content is not None:
+            buffer += chunk.choices[0].delta.content
+            accumulated_response += chunk.choices[0].delta.content
+            
+            # バッファが一定の長さに達したら更新
+            if len(buffer) >= 20:
+                client.chat_update(
+                    channel=channel_id,
+                    ts=message_ts,
+                    text=accumulated_response
+                )
+                buffer = ""
+    
+    # 最終更新
+    if accumulated_response:
+        client.chat_update(
+            channel=channel_id,
+            ts=message_ts,
+            text=accumulated_response
+        )
+    
+    return accumulated_response
+
+def handle_claude(text, history, channel_id, thread_ts, message_ts, client):
+    """Handle Claude chat completion with streaming"""
+    messages = []
+    for msg in history:
+        messages.append({
+            "role": msg["role"],
+            "content": msg["content"]
+        })
+    messages.append({"role": "user", "content": text})
+    
+    accumulated_response = ""
+    buffer = ""
+    
+    with anthropic.messages.stream(
+        model="claude-3-sonnet-20240229",
+        messages=messages
+    ) as stream:
+        for chunk in stream:
+            if chunk.type == "content_block_delta":
+                buffer += chunk.delta.text
+                accumulated_response += chunk.delta.text
+                
+                # バッファが一定の長さに達したら更新
+                if len(buffer) >= 20:
+                    client.chat_update(
+                        channel=channel_id,
+                        ts=message_ts,
+                        text=accumulated_response
+                    )
+                    buffer = ""
+    
+    # 最終更新
+    if accumulated_response:
+        client.chat_update(
+            channel=channel_id,
+            ts=message_ts,
+            text=accumulated_response
+        )
+    
+    return accumulated_response
+
+def handle_gemini(text, history, channel_id, thread_ts, message_ts, client):
+    """Handle Gemini chat completion with streaming"""
+    model = genai.GenerativeModel('gemini-pro')
+    chat = model.start_chat(history=[
+        {"role": msg["role"], "parts": [msg["content"]]} for msg in history
+    ])
+    
+    accumulated_response = ""
+    buffer = ""
+    
+    response = chat.send_message(text, stream=True)
+    for chunk in response:
+        if chunk.text:
+            buffer += chunk.text
+            accumulated_response += chunk.text
+            
+            # バッファが一定の長さに達したら更新
+            if len(buffer) >= 20:
+                client.chat_update(
+                    channel=channel_id,
+                    ts=message_ts,
+                    text=accumulated_response
+                )
+                buffer = ""
+    
+    # 最終更新
+    if accumulated_response:
+        client.chat_update(
+            channel=channel_id,
+            ts=message_ts,
+            text=accumulated_response
+        )
+    
+    return accumulated_response
+
 def handle_mention(event, say):
     """Handle mentions and route to appropriate AI service"""
     process_message(event, say, is_mention=True)
 
-# @app.event("message")
 def handle_message(event, say):
     """Handle messages in threads"""
     # Ignore messages from bots
@@ -89,44 +204,6 @@ def handle_message(event, say):
         
     # Process the message
     process_message(event, say)
-
-def handle_openai(text, history):
-    """Handle OpenAI chat completion"""
-    messages = [{"role": "system", "content": "You are a helpful assistant."}]
-    for msg in history:
-        messages.append({"role": msg["role"], "content": msg["content"]})
-    messages.append({"role": "user", "content": text})
-    
-    response = openai.chat.completions.create(
-        model="gpt-4-turbo-preview",
-        messages=messages
-    )
-    return response.choices[0].message.content
-
-def handle_claude(text, history):
-    """Handle Claude chat completion"""
-    messages = []
-    for msg in history:
-        messages.append({
-            "role": msg["role"],
-            "content": msg["content"]
-        })
-    messages.append({"role": "user", "content": text})
-    
-    response = anthropic.messages.create(
-        model="claude-3-sonnet-20240229",
-        messages=messages
-    )
-    return response.content[0].text
-
-def handle_gemini(text, history):
-    """Handle Gemini chat completion"""
-    model = genai.GenerativeModel('gemini-pro')
-    chat = model.start_chat(history=[
-        {"role": msg["role"], "parts": [msg["content"]]} for msg in history
-    ])
-    response = chat.send_message(text)
-    return response.text
 
 def just_ack(ack):
     ack()
