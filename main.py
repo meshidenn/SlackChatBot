@@ -1,5 +1,6 @@
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
+from slack_sdk.models.blocks import ButtonElement, ActionsBlock
 from google.cloud import firestore
 import os
 from datetime import datetime
@@ -36,13 +37,30 @@ def get_conversation_history(channel_id, thread_ts):
         print(f"Error getting conversation history: {e}")
         return []
 
-def save_conversation(channel_id, thread_ts, messages):
+def save_conversation(channel_id, thread_ts, messages, model=None):
     """Save conversation to Firestore"""
-    doc_ref = db.collection('conversations').document(f"{channel_id}_{thread_ts}")
-    doc_ref.set({
+    data = {
         'messages': messages,
         'updated_at': datetime.now()
-    })
+    }
+    if model:
+        data['model'] = model
+    
+    doc_ref = db.collection('conversations').document(f"{channel_id}_{thread_ts}")
+    doc_ref.set(data)
+
+def get_thread_model(channel_id, thread_ts):
+    """Get the model being used in the thread"""
+    try:
+        doc_ref = db.collection('conversations').document(f"{channel_id}_{thread_ts}")
+        doc = doc_ref.get()
+        if doc.exists:
+            data = doc.to_dict()
+            if data and 'model' in data:
+                return data['model']
+    except Exception as e:
+        print(f"Error getting thread model: {e}")
+    return "openai"  # default to OpenAI
 
 def update_message(client, channel_id, message_ts, text):
     """Update Slack message with accumulated response"""
@@ -110,6 +128,7 @@ class ClaudeHandler(AIHandler):
         messages.append({"role": "user", "content": text})
         
         with anthropic.messages.stream(
+            max_tokens=1024,
             model="claude-3-sonnet-20240229",
             messages=messages
         ) as stream:
@@ -143,47 +162,140 @@ def get_ai_handler(ai_type, channel_id, message_ts, client):
     handler_class = handlers.get(ai_type, OpenAIHandler)
     return handler_class(channel_id, message_ts, client)
 
-def process_message(event, say, is_mention=False):
-    """Process message and route to appropriate AI service"""
-    text = event.get("text", "")
-    channel_id = event.get("channel")
-    thread_ts = event.get("thread_ts", event.get("ts"))
+def create_model_selection_blocks():
+    """Create blocks with model selection buttons"""
+    return [
+        ActionsBlock(
+            elements=[
+                ButtonElement(
+                    text="OpenAI GPT-4",
+                    action_id="select_model_openai",
+                    value="openai"
+                ),
+                ButtonElement(
+                    text="Claude 3",
+                    action_id="select_model_claude",
+                    value="claude"
+                ),
+                ButtonElement(
+                    text="Gemini Pro",
+                    action_id="select_model_gemini",
+                    value="gemini"
+                )
+            ]
+        )
+    ]
+
+def get_model_name(ai_type):
+    """Get human-readable model name"""
+    model_names = {
+        "openai": "OpenAI GPT-4",
+        "claude": "Claude 3",
+        "gemini": "Gemini Pro"
+    }
+    return model_names.get(ai_type, "Unknown Model")
+
+def process_with_model(channel_id, thread_ts, text, history, message_ts, client, ai_type, save_model=False):
+    """Process message with specified model"""
+    model_name = get_model_name(ai_type)
     
-    # Remove bot mention from text if it's a mention
-    if is_mention:
-        text = ' '.join(text.split()[1:])
+    # Update message to show thinking state
+    client.chat_update(
+        channel=channel_id,
+        ts=message_ts,
+        text=f"思考中... (Using {model_name})",
+        blocks=[]
+    )
     
-    # Get conversation history
-    history = get_conversation_history(channel_id, thread_ts)
-    
-    # Send initial message
-    initial_response = say(text="思考中...", thread_ts=thread_ts)
-    message_ts = initial_response['ts']
-    
-    # Determine which AI to use
-    ai_type = "openai"  # default
-    for ai in ["openai", "claude", "gemini"]:
-        if ai in text.lower():
-            ai_type = ai
-            break
-    
-    # Get appropriate handler and process message
-    handler = get_ai_handler(ai_type, channel_id, message_ts, app.client)
+    # Process with selected model
+    handler = get_ai_handler(ai_type, channel_id, message_ts, client)
     final_response = handler.process_stream(text, history)
+    
+    # Add model info to the response
+    final_response_with_model = f"[{model_name}]\n{final_response}"
+    
+    # Update the message with the final response including model info
+    client.chat_update(
+        channel=channel_id,
+        ts=message_ts,
+        text=final_response_with_model
+    )
     
     # Save the updated conversation
     history.extend([
         {"role": "user", "content": text},
         {"role": "assistant", "content": final_response}
     ])
-    save_conversation(channel_id, thread_ts, history)
+    save_conversation(channel_id, thread_ts, history, ai_type if save_model else None)
 
-def handle_mention(event, say):
-    """Handle mentions and route to appropriate AI service"""
-    process_message(event, say, is_mention=True)
+def process_mention(event, say):
+    """Process mention and show model selection"""
+    text = ' '.join(event.get("text", "").split()[1:])  # Remove bot mention
+    channel_id = event.get("channel")
+    thread_ts = event.get("thread_ts", event.get("ts"))
+    
+    # Get conversation history
+    history = get_conversation_history(channel_id, thread_ts)
+    
+    # Send initial message with model selection buttons
+    initial_response = say(
+        blocks=[
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "使用するモデルを選択してください"
+                }
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "OpenAI GPT-4"
+                        },
+                        "action_id": "select_model_openai",
+                        "value": "openai"
+                    },
+                    {
+                        "type": "button",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "Claude 3"
+                        },
+                        "action_id": "select_model_claude",
+                        "value": "claude"
+                    },
+                    {
+                        "type": "button",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "Gemini Pro"
+                        },
+                        "action_id": "select_model_gemini",
+                        "value": "gemini"
+                    }
+                ]
+            }
+        ],
+        thread_ts=thread_ts
+    )
+    message_ts = initial_response['ts']
+    
+    # Store the message info for later processing
+    doc_ref = db.collection('pending_messages').document(message_ts)
+    doc_ref.set({
+        'channel_id': channel_id,
+        'thread_ts': thread_ts,
+        'text': text,
+        'history': history,
+        'created_at': datetime.now()
+    })
 
-def handle_message(event, say):
-    """Handle messages in threads"""
+def process_message(event, say):
+    """Process thread message with thread's model"""
     # Ignore messages from bots
     if event.get("bot_id"):
         return "OK"
@@ -191,15 +303,64 @@ def handle_message(event, say):
     # Only process messages in threads
     if not event.get("thread_ts"):
         return "OK"
-        
-    # Process the message
+    
+    text = event.get("text", "")
+    channel_id = event.get("channel")
+    thread_ts = event.get("thread_ts")
+    
+    # Get conversation history and thread's model
+    history = get_conversation_history(channel_id, thread_ts)
+    model = get_thread_model(channel_id, thread_ts)
+    
+    # Send initial message
+    initial_response = say(text="思考中...", thread_ts=thread_ts)
+    message_ts = initial_response['ts']
+    
+    # Process with thread's model
+    process_with_model(channel_id, thread_ts, text, history, message_ts, app.client, model)
+
+def handle_mention(event, say):
+    """Handle mentions and show model selection"""
+    process_mention(event, say)
+
+def handle_message(event, say):
+    """Handle thread messages with default model"""
     process_message(event, say)
+
+def handle_model_selection(ack, body, client):
+    """Handle model selection button click"""
+    ack()
+    
+    # Get message info
+    message_ts = body["message"]["ts"]
+    doc_ref = db.collection('pending_messages').document(message_ts)
+    doc = doc_ref.get()
+    
+    if not doc.exists:
+        return
+    
+    data = doc.to_dict()
+    channel_id = data['channel_id']
+    thread_ts = data['thread_ts']
+    text = data['text']
+    history = data['history']
+    
+    # Get selected model and process
+    ai_type = body["actions"][0]["value"]
+    process_with_model(channel_id, thread_ts, text, history, message_ts, client, ai_type, save_model=True)
+    
+    # Clean up pending message
+    doc_ref.delete()
 
 def just_ack(ack):
     ack()
-    
+
+# Register handlers
 app.event("app_mention")(ack=just_ack, lazy=[handle_mention])
 app.event("message")(ack=just_ack, lazy=[handle_message])
+app.action("select_model_openai")(handle_model_selection)
+app.action("select_model_claude")(handle_model_selection)
+app.action("select_model_gemini")(handle_model_selection)
 
 if __name__ == "__main__":
     handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
