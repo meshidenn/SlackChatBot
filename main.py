@@ -23,11 +23,17 @@ db = firestore.Client()
 
 def get_conversation_history(channel_id, thread_ts):
     """Get conversation history from Firestore"""
-    doc_ref = db.collection('conversations').document(f"{channel_id}_{thread_ts}")
-    doc = doc_ref.get()
-    if doc.exists:
-        return doc.to_dict().get('messages', [])
-    return []
+    try:
+        doc_ref = db.collection('conversations').document(f"{channel_id}_{thread_ts}")
+        doc = doc_ref.get()
+        if doc.exists:
+            data = doc.to_dict()
+            if data and 'messages' in data:
+                return data['messages']
+        return []
+    except Exception as e:
+        print(f"Error getting conversation history: {e}")
+        return []
 
 def save_conversation(channel_id, thread_ts, messages):
     """Save conversation to Firestore"""
