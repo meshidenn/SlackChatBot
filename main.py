@@ -7,6 +7,7 @@ import openai
 from anthropic import Anthropic
 import google.generativeai as genai
 from dotenv import load_dotenv
+from abc import ABC, abstractmethod
 
 load_dotenv()
 
@@ -43,6 +44,105 @@ def save_conversation(channel_id, thread_ts, messages):
         'updated_at': datetime.now()
     })
 
+def update_message(client, channel_id, message_ts, text):
+    """Update Slack message with accumulated response"""
+    client.chat_update(
+        channel=channel_id,
+        ts=message_ts,
+        text=text
+    )
+
+class AIHandler(ABC):
+    def __init__(self, channel_id, message_ts, client):
+        self.channel_id = channel_id
+        self.message_ts = message_ts
+        self.client = client
+        self.buffer = ""
+        self.accumulated_response = ""
+        
+    def handle_chunk(self, chunk_text):
+        """Handle streaming chunk and update message"""
+        self.buffer += chunk_text
+        self.accumulated_response += chunk_text
+        
+        if len(self.buffer) >= 20:
+            update_message(self.client, self.channel_id, self.message_ts, self.accumulated_response)
+            self.buffer = ""
+    
+    def finalize_response(self):
+        """Send final update if needed"""
+        if self.accumulated_response:
+            update_message(self.client, self.channel_id, self.message_ts, self.accumulated_response)
+        return self.accumulated_response
+    
+    @abstractmethod
+    def process_stream(self, text, history):
+        """Process the stream for specific AI service"""
+        pass
+
+class OpenAIHandler(AIHandler):
+    def process_stream(self, text, history):
+        messages = [{"role": "system", "content": "You are a helpful assistant."}]
+        for msg in history:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+        messages.append({"role": "user", "content": text})
+        
+        stream = openai.chat.completions.create(
+            model="gpt-4-turbo-preview",
+            messages=messages,
+            stream=True
+        )
+        
+        for chunk in stream:
+            if chunk.choices[0].delta.content is not None:
+                self.handle_chunk(chunk.choices[0].delta.content)
+        
+        return self.finalize_response()
+
+class ClaudeHandler(AIHandler):
+    def process_stream(self, text, history):
+        messages = []
+        for msg in history:
+            messages.append({
+                "role": msg["role"],
+                "content": msg["content"]
+            })
+        messages.append({"role": "user", "content": text})
+        
+        with anthropic.messages.stream(
+            model="claude-3-sonnet-20240229",
+            messages=messages
+        ) as stream:
+            for chunk in stream:
+                if chunk.type == "content_block_delta":
+                    self.handle_chunk(chunk.delta.text)
+        
+        return self.finalize_response()
+
+class GeminiHandler(AIHandler):
+    def process_stream(self, text, history):
+        model = genai.GenerativeModel('gemini-pro')
+        chat = model.start_chat(history=[
+            {"role": msg["role"], "parts": [msg["content"]]} for msg in history
+        ])
+        
+        response = chat.send_message(text, stream=True)
+        for chunk in response:
+            if chunk.text:
+                self.handle_chunk(chunk.text)
+        
+        return self.finalize_response()
+
+def get_ai_handler(ai_type, channel_id, message_ts, client):
+    """Factory function to get appropriate AI handler"""
+    handlers = {
+        "openai": OpenAIHandler,
+        "claude": ClaudeHandler,
+        "gemini": GeminiHandler
+    }
+    handler_class = handlers.get(ai_type, OpenAIHandler)
+    return handler_class(channel_id, message_ts, client)
+
 def process_message(event, say, is_mention=False):
     """Process message and route to appropriate AI service"""
     text = event.get("text", "")
@@ -60,16 +160,16 @@ def process_message(event, say, is_mention=False):
     initial_response = say(text="思考中...", thread_ts=thread_ts)
     message_ts = initial_response['ts']
     
-    # Determine which AI to use based on text and get streaming response
-    if "openai" in text.lower():
-        final_response = handle_openai(text, history, channel_id, thread_ts, message_ts, app.client)
-    elif "claude" in text.lower():
-        final_response = handle_claude(text, history, channel_id, thread_ts, message_ts, app.client)
-    elif "gemini" in text.lower():
-        final_response = handle_gemini(text, history, channel_id, thread_ts, message_ts, app.client)
-    else:
-        # Default to OpenAI
-        final_response = handle_openai(text, history, channel_id, thread_ts, message_ts, app.client)
+    # Determine which AI to use
+    ai_type = "openai"  # default
+    for ai in ["openai", "claude", "gemini"]:
+        if ai in text.lower():
+            ai_type = ai
+            break
+    
+    # Get appropriate handler and process message
+    handler = get_ai_handler(ai_type, channel_id, message_ts, app.client)
+    final_response = handler.process_stream(text, history)
     
     # Save the updated conversation
     history.extend([
@@ -77,122 +177,6 @@ def process_message(event, say, is_mention=False):
         {"role": "assistant", "content": final_response}
     ])
     save_conversation(channel_id, thread_ts, history)
-
-def handle_openai(text, history, channel_id, thread_ts, message_ts, client):
-    """Handle OpenAI chat completion with streaming"""
-    messages = [{"role": "system", "content": "You are a helpful assistant."}]
-    for msg in history:
-        messages.append({"role": msg["role"], "content": msg["content"]})
-    messages.append({"role": "user", "content": text})
-    
-    accumulated_response = ""
-    buffer = ""
-    
-    stream = openai.chat.completions.create(
-        model="gpt-4-turbo-preview",
-        messages=messages,
-        stream=True
-    )
-    
-    for chunk in stream:
-        if chunk.choices[0].delta.content is not None:
-            buffer += chunk.choices[0].delta.content
-            accumulated_response += chunk.choices[0].delta.content
-            
-            # バッファが一定の長さに達したら更新
-            if len(buffer) >= 20:
-                client.chat_update(
-                    channel=channel_id,
-                    ts=message_ts,
-                    text=accumulated_response
-                )
-                buffer = ""
-    
-    # 最終更新
-    if accumulated_response:
-        client.chat_update(
-            channel=channel_id,
-            ts=message_ts,
-            text=accumulated_response
-        )
-    
-    return accumulated_response
-
-def handle_claude(text, history, channel_id, thread_ts, message_ts, client):
-    """Handle Claude chat completion with streaming"""
-    messages = []
-    for msg in history:
-        messages.append({
-            "role": msg["role"],
-            "content": msg["content"]
-        })
-    messages.append({"role": "user", "content": text})
-    
-    accumulated_response = ""
-    buffer = ""
-    
-    with anthropic.messages.stream(
-        model="claude-3-sonnet-20240229",
-        messages=messages
-    ) as stream:
-        for chunk in stream:
-            if chunk.type == "content_block_delta":
-                buffer += chunk.delta.text
-                accumulated_response += chunk.delta.text
-                
-                # バッファが一定の長さに達したら更新
-                if len(buffer) >= 20:
-                    client.chat_update(
-                        channel=channel_id,
-                        ts=message_ts,
-                        text=accumulated_response
-                    )
-                    buffer = ""
-    
-    # 最終更新
-    if accumulated_response:
-        client.chat_update(
-            channel=channel_id,
-            ts=message_ts,
-            text=accumulated_response
-        )
-    
-    return accumulated_response
-
-def handle_gemini(text, history, channel_id, thread_ts, message_ts, client):
-    """Handle Gemini chat completion with streaming"""
-    model = genai.GenerativeModel('gemini-pro')
-    chat = model.start_chat(history=[
-        {"role": msg["role"], "parts": [msg["content"]]} for msg in history
-    ])
-    
-    accumulated_response = ""
-    buffer = ""
-    
-    response = chat.send_message(text, stream=True)
-    for chunk in response:
-        if chunk.text:
-            buffer += chunk.text
-            accumulated_response += chunk.text
-            
-            # バッファが一定の長さに達したら更新
-            if len(buffer) >= 20:
-                client.chat_update(
-                    channel=channel_id,
-                    ts=message_ts,
-                    text=accumulated_response
-                )
-                buffer = ""
-    
-    # 最終更新
-    if accumulated_response:
-        client.chat_update(
-            channel=channel_id,
-            ts=message_ts,
-            text=accumulated_response
-        )
-    
-    return accumulated_response
 
 def handle_mention(event, say):
     """Handle mentions and route to appropriate AI service"""
