@@ -8,12 +8,14 @@ dependencies = [
     "anthropic>=0.18.1",
     "google-generativeai>=0.3.2",
     "google-cloud-firestore>=2.15.0",
-    "python-dotenv>=1.0.1",
+    "functions-framework>=3.5.0",
+    "flask>=2.3.3",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.2.0",
+    "python-dotenv>=1.0.1",  # moved to dev dependencies as it's only needed for local development
 ]
 
 [build-system]

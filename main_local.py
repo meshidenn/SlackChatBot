@@ -1,6 +1,5 @@
 from slack_bolt import App
-from slack_bolt.adapter.flask import SlackRequestHandler
-from flask import Flask, request
+from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.models.blocks import ButtonElement, ActionsBlock
 from google.cloud import firestore
 import os
@@ -8,18 +7,13 @@ from datetime import datetime
 import openai
 from anthropic import Anthropic
 import google.generativeai as genai
+from dotenv import load_dotenv
 from abc import ABC, abstractmethod
-import functions_framework
 
-# Initialize Slack app with signing secret
-app = App(
-    token=os.environ["SLACK_BOT_TOKEN"],
-    signing_secret=os.environ["SLACK_SIGNING_SECRET"]
-)
+load_dotenv()
 
-# Initialize Flask app for local development
-flask_app = Flask(__name__)
-handler = SlackRequestHandler(app)
+# Initialize Slack app
+app = App(token=os.environ["SLACK_BOT_TOKEN"])
 
 # Initialize AI clients
 openai.api_key = os.environ["OPENAI_API_KEY"]
@@ -68,42 +62,63 @@ def get_thread_model(channel_id, thread_ts):
         print(f"Error getting thread model: {e}")
     return "openai"  # default to OpenAI
 
+def update_message(client, channel_id, message_ts, text):
+    """Update Slack message with accumulated response"""
+    client.chat_update(
+        channel=channel_id,
+        ts=message_ts,
+        text=text
+    )
+
 class AIHandler(ABC):
     def __init__(self, channel_id, message_ts, client):
         self.channel_id = channel_id
         self.message_ts = message_ts
         self.client = client
-        self.response = ""
+        self.buffer = ""
+        self.accumulated_response = ""
         
-    def update_message(self, text):
-        """Update Slack message"""
-        self.client.chat_update(
-            channel=self.channel_id,
-            ts=self.message_ts,
-            text=text
-        )
+    def handle_chunk(self, chunk_text):
+        """Handle streaming chunk and update message"""
+        self.buffer += chunk_text
+        self.accumulated_response += chunk_text
+        
+        if len(self.buffer) >= 20:
+            update_message(self.client, self.channel_id, self.message_ts, self.accumulated_response)
+            self.buffer = ""
+    
+    def finalize_response(self):
+        """Send final update if needed"""
+        if self.accumulated_response:
+            update_message(self.client, self.channel_id, self.message_ts, self.accumulated_response)
+        return self.accumulated_response
     
     @abstractmethod
-    def process_message(self, text, history):
-        """Process message for specific AI service"""
+    def process_stream(self, text, history):
+        """Process the stream for specific AI service"""
         pass
 
 class OpenAIHandler(AIHandler):
-    def process_message(self, text, history):
+    def process_stream(self, text, history):
         messages = [{"role": "system", "content": "You are a helpful assistant."}]
         for msg in history:
             messages.append({"role": msg["role"], "content": msg["content"]})
         messages.append({"role": "user", "content": text})
         
-        response = openai.chat.completions.create(
+        stream = openai.chat.completions.create(
             model="gpt-4-turbo-preview",
-            messages=messages
+            messages=messages,
+            stream=True
         )
         
-        return response.choices[0].message.content
+        for chunk in stream:
+            if chunk.choices[0].delta.content is not None:
+                self.handle_chunk(chunk.choices[0].delta.content)
+        
+        return self.finalize_response()
 
 class ClaudeHandler(AIHandler):
-    def process_message(self, text, history):
+    def process_stream(self, text, history):
         messages = []
         for msg in history:
             messages.append({
@@ -112,27 +127,30 @@ class ClaudeHandler(AIHandler):
             })
         messages.append({"role": "user", "content": text})
         
-        response = anthropic.messages.create(
-            model="claude-3-sonnet-20240229",
+        with anthropic.messages.stream(
             max_tokens=1024,
+            model="claude-3-sonnet-20240229",
             messages=messages
-        )
+        ) as stream:
+            for chunk in stream:
+                if chunk.type == "content_block_delta":
+                    self.handle_chunk(chunk.delta.text)
         
-        return response.content[0].text
+        return self.finalize_response()
 
 class GeminiHandler(AIHandler):
-    def process_message(self, text, history):
+    def process_stream(self, text, history):
         model = genai.GenerativeModel('gemini-pro')
+        chat = model.start_chat(history=[
+            {"role": msg["role"], "parts": [msg["content"]]} for msg in history
+        ])
         
-        # Convert history roles from 'assistant' to 'model' for Gemini
-        gemini_history = []
-        for msg in history:
-            role = "model" if msg["role"] == "assistant" else msg["role"]
-            gemini_history.append({"role": role, "parts": [msg["content"]]})
+        response = chat.send_message(text, stream=True)
+        for chunk in response:
+            if chunk.text:
+                self.handle_chunk(chunk.text)
         
-        chat = model.start_chat(history=gemini_history)
-        response = chat.send_message(text)
-        return response.text
+        return self.finalize_response()
 
 def get_ai_handler(ai_type, channel_id, message_ts, client):
     """Factory function to get appropriate AI handler"""
@@ -143,6 +161,30 @@ def get_ai_handler(ai_type, channel_id, message_ts, client):
     }
     handler_class = handlers.get(ai_type, OpenAIHandler)
     return handler_class(channel_id, message_ts, client)
+
+def create_model_selection_blocks():
+    """Create blocks with model selection buttons"""
+    return [
+        ActionsBlock(
+            elements=[
+                ButtonElement(
+                    text="OpenAI GPT-4",
+                    action_id="select_model_openai",
+                    value="openai"
+                ),
+                ButtonElement(
+                    text="Claude 3",
+                    action_id="select_model_claude",
+                    value="claude"
+                ),
+                ButtonElement(
+                    text="Gemini Pro",
+                    action_id="select_model_gemini",
+                    value="gemini"
+                )
+            ]
+        )
+    ]
 
 def get_model_name(ai_type):
     """Get human-readable model name"""
@@ -167,22 +209,22 @@ def process_with_model(channel_id, thread_ts, text, history, message_ts, client,
     
     # Process with selected model
     handler = get_ai_handler(ai_type, channel_id, message_ts, client)
-    response = handler.process_message(text, history)
+    final_response = handler.process_stream(text, history)
     
     # Add model info to the response
-    final_response = f"[{model_name}]\n{response}"
+    final_response_with_model = f"[{model_name}]\n{final_response}"
     
-    # Update the message with the final response
+    # Update the message with the final response including model info
     client.chat_update(
         channel=channel_id,
         ts=message_ts,
-        text=final_response
+        text=final_response_with_model
     )
     
     # Save the updated conversation
     history.extend([
         {"role": "user", "content": text},
-        {"role": "assistant", "content": response}
+        {"role": "assistant", "content": final_response}
     ])
     save_conversation(channel_id, thread_ts, history, ai_type if save_model else None)
 
@@ -256,11 +298,11 @@ def process_message(event, say):
     """Process thread message with thread's model"""
     # Ignore messages from bots
     if event.get("bot_id"):
-        return
+        return "OK"
         
     # Only process messages in threads
     if not event.get("thread_ts"):
-        return
+        return "OK"
     
     text = event.get("text", "")
     channel_id = event.get("channel")
@@ -276,6 +318,14 @@ def process_message(event, say):
     
     # Process with thread's model
     process_with_model(channel_id, thread_ts, text, history, message_ts, app.client, model)
+
+def handle_mention(event, say):
+    """Handle mentions and show model selection"""
+    process_mention(event, say)
+
+def handle_message(event, say):
+    """Handle thread messages with default model"""
+    process_message(event, say)
 
 def handle_model_selection(ack, body, client):
     """Handle model selection button click"""
@@ -306,23 +356,12 @@ def just_ack(ack):
     ack()
 
 # Register handlers
-app.event("app_mention")(process_mention)
-app.event("message")(process_message)
+app.event("app_mention")(ack=just_ack, lazy=[handle_mention])
+app.event("message")(ack=just_ack, lazy=[handle_message])
 app.action("select_model_openai")(handle_model_selection)
 app.action("select_model_claude")(handle_model_selection)
 app.action("select_model_gemini")(handle_model_selection)
 
-# Cloud Functions entry point
-@functions_framework.http
-def handle_slack_event(request):
-    """Cloud Functions entry point"""
-    return handler.handle(request)
-
-# Flask route for local development
-@flask_app.route("/slack/events", methods=["POST"])
-def slack_events():
-    return handler.handle(request)
-
-# Local development server
 if __name__ == "__main__":
-    flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), debug=True)
+    handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
+    handler.start()
