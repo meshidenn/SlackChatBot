@@ -316,11 +316,23 @@ app.action("select_model_gemini")(handle_model_selection)
 @functions_framework.http
 def handle_slack_event(request):
     """Cloud Functions entry point"""
+    # Handle Slack URL verification
+    if request.is_json:
+        body = request.get_json()
+        if body.get("type") == "url_verification":
+            return {"challenge": body["challenge"]}
+    
     return handler.handle(request)
 
 # Flask route for local development
 @flask_app.route("/slack/events", methods=["POST"])
 def slack_events():
+    # Handle Slack URL verification
+    if request.is_json:
+        body = request.get_json()
+        if body.get("type") == "url_verification":
+            return {"challenge": body["challenge"]}
+    
     return handler.handle(request)
 
 # Local development server
